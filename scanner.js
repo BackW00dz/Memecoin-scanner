@@ -12,43 +12,79 @@ const THRESHOLDS = {
 };
 
 const $=s=>document.querySelector(s);
-const fmtMoney=n=>{n=Number(n||0);if(n>=1e9)return '$'+(n/1e9).toFixed(2)+'B';if(n>=1e6)return '$'+(n/1e6).toFixed(2)+'M';if(n>=1e3)return '$'+(n/1e3).toFixed(1)+'K';if(n>=1)return '$'+n.toFixed(2);return '$'+n.toPrecision(3)};
+const fmtMoney=n=>{n=Number(n||0);if(!isFinite(n))return '$0.00';if(n>=1e9)return '$'+(n/1e9).toFixed(2)+'B';if(n>=1e6)return '$'+(n/1e6).toFixed(2)+'M';if(n>=1e3)return '$'+(n/1e3).toFixed(1)+'K';if(n>=1)return '$'+n.toFixed(2);return '$'+n.toFixed(6);};
 const fmtPct=n=>`${n>=0?'+':''}${Number(n||0).toFixed(1)}%`;
 const fmtNum=n=>Number(n||0).toLocaleString();
-const ageHours=ts=>ts?Math.max(0,(Date.now()-ts)/36e5):9999;
+const ageHours=ts=>{
+  if(!ts) return 9999;
+  // Normalize seconds->ms if necessary
+  if (ts > 0 && ts < 1e12) ts = ts * 1000;
+  return Math.max(0,(Date.now()-ts)/36e5);
+};
 
 /**
- * Validate if a URL is safe to embed (HTTPS only)
+ * Validate if a URL is safe to embed (HTTPS only for images/iframes)
  */
 function isSafeUrl(url) {
   if (!url) return false;
   try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'https:';
+    const parsed = new URL(url, window.location.origin);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
   } catch {
     return false;
   }
 }
 
 /**
- * Fetch with retry logic and rate-limit handling (429)
+ * Validate/normalize hrefs used for anchors. Only allow http(s), otherwise return '#'.
+ */
+function safeHref(url) {
+  if (!url) return '#';
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.href;
+  } catch(e) {}
+  return '#';
+}
+
+/**
+ * Fetch with timeout
+ */
+async function fetchWithTimeout(url, options = {}, timeout = 10000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const r = await fetch(url, {...options, signal: controller.signal});
+    return r;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+/**
+ * Fetch with retry logic and rate-limit handling (429) and safer JSON parsing
  */
 async function fetchWithRetry(url, maxRetries = 2) {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const r = await fetch(url, { headers: { accept: 'application/json' } });
+      const r = await fetchWithTimeout(url, { headers: { accept: 'application/json' } }, 10000);
       if (r.status === 429) {
-        // Rate limited: respect Retry-After header
         const delay = parseInt(r.headers.get('retry-after') || '5') * 1000;
         console.warn(`Rate limited. Waiting ${delay}ms before retry.`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
+      if (r.status === 204) return null; // no content
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) return null;
+      try {
+        return await r.json();
+      } catch (e) {
+        throw new Error('Invalid JSON response');
+      }
     } catch (e) {
       if (i === maxRetries - 1) throw e;
-      // Exponential backoff: 1s, 2s, 4s, ...
       const delay = 1000 * Math.pow(2, i);
       console.warn(`Fetch failed (attempt ${i + 1}/${maxRetries}). Retrying in ${delay}ms`, e.message);
       await new Promise(resolve => setTimeout(resolve, delay));
@@ -109,6 +145,10 @@ function risk(p){
 }
 
 function normalize(p){
+  // Normalize timestamp units if necessary
+  if (p && p.pairCreatedAt && p.pairCreatedAt > 0 && p.pairCreatedAt < 1e12) {
+    p.pairCreatedAt = p.pairCreatedAt * 1000; // seconds -> ms
+  }
   return {...p, score: calcScore(p), risk: risk(p)};
 }
 
@@ -167,9 +207,30 @@ async function scan(){
 function demoTokens(){
   const now = Date.now();
   return [
-    {chainId:'solana',dexId:'demo',url:'#',pairAddress:'demo1',baseToken:{address:'Demo1',name:'Signal Ape',symbol:'SAPE'},quoteToken:{symbol:'SOL'},priceUsd:'0.00081',priceChange:{h24:126.4},volume:{h24:1480000},liquidity:{usd:210000},marketCap:2700000,fdv:810000,txns:{h24:{buys:4820,sells:2670}},pairCreatedAt:now-7*36e5,boosts:{active:24},info:{socials:[{}],websites:[{}]}},
-    {chainId:'solana',dexId:'demo',url:'#',pairAddress:'demo2',baseToken:{address:'Demo2',name:'Moon Raccoon',symbol:'MRAC'},quoteToken:{symbol:'SOL'},priceUsd:'0.0042',priceChange:{h24:72.8},volume:{h24:820000},liquidity:{usd:145000},marketCap:1900000,fdv:4200000,txns:{h24:{buys:2900,sells:1710}},pairCreatedAt:now-18*36e5,boosts:{active:9},info:{socials:[{}]}},
-    {chainId:'solana',dexId:'demo',url:'#',pairAddress:'demo3',baseToken:{address:'Demo3',name:'Pixel Dog',symbol:'PDOG'},quoteToken:{symbol:'SOL'},priceUsd:'0.00017',priceChange:{h24:41.3},volume:{h24:350000},liquidity:{usd:58000},marketCap:920000,fdv:1700000,txns:{h24:{buys:1300,sells:990}},pairCreatedAt:now-31*36e5,boosts:{active:4},info:{}}
+    {
+      chainId:'solana',dexId:'demo',url:'#',pairAddress:'demo1',
+      baseToken:{address:'Demo1',name:'Signal Ape',symbol:'SAPE'},
+      quoteToken:{symbol:'SOL'},priceUsd:'0.00081',priceChange:{h24:126.4},volume:{h24:12345},
+      liquidity:{usd:45000},marketCap:120000,fdv:120000,boosts:{active:5},
+      txns:{h24:{buys:80,sells:20}},info:{imageUrl:'',socials:['twitter.com/signalape'],websites:[]},
+      pairCreatedAt: now - 2*36e5
+    },
+    {
+      chainId:'solana',dexId:'demo',url:'#',pairAddress:'demo2',
+      baseToken:{address:'Demo2',name:'Moon Raccoon',symbol:'MRAC'},
+      quoteToken:{symbol:'SOL'},priceUsd:'0.0042',priceChange:{h24:72.8},volume:{h24:8600},
+      liquidity:{usd:25000},marketCap:80000,fdv:80000,boosts:{active:2},
+      txns:{h24:{buys:50,sells:25}},info:{imageUrl:'',socials:[],websites:[]},
+      pairCreatedAt: now - 10*36e5
+    },
+    {
+      chainId:'solana',dexId:'demo',url:'#',pairAddress:'demo3',
+      baseToken:{address:'Demo3',name:'Pixel Dog',symbol:'PDOG'},
+      quoteToken:{symbol:'SOL'},priceUsd:'0.00017',priceChange:{h24:41.3},volume:{h24:4200},
+      liquidity:{usd:15000},marketCap:40000,fdv:40000,boosts:{active:1},
+      txns:{h24:{buys:30,sells:20}},info:{imageUrl:'',socials:[],websites:[]},
+      pairCreatedAt: now - 30*36e5
+    }
   ];
 }
 
@@ -200,7 +261,7 @@ function render(){
   
   const alerts = state.filtered.filter(x => x.score >= THRESHOLDS.BREAKOUT_SCORE).slice(0, 1);
   $('#alerts').innerHTML = alerts.length
-    ? `<div class="alert"><strong>🚨 ${esc(alerts[0].baseToken.symbol)} crossed ${alerts[0].score}/100</strong><span>Strong momentum detected. Review liquidity and holder concentration before considering any trade.</span></div>`
+    ? `<div class="alert"><strong>🚨 ${esc(alerts[0].baseToken.symbol)} crossed ${alerts[0].score}/100</strong><span>Strong momentum detected. Review liquidity and holder concentration before committing funds.</span></div>`
     : '';
   
   if (!state.filtered.length) {
@@ -213,7 +274,7 @@ function render(){
     const r = p.risk;
     const icon = p.info?.imageUrl || p.info?.image || '';
     const iconHtml = isSafeUrl(icon)
-      ? `<img class="token-icon" src="${icon}" alt="">`
+      ? `<img class="token-icon" src="${esc(icon)}" alt="${esc(p.baseToken?.symbol||'')}">`
       : `<div class="token-icon"></div>`;
     
     const scoreClass = p.score >= THRESHOLDS.SCORE_HIGH ? '' : p.score >= THRESHOLDS.SCORE_WATCH ? 'watch' : 'low';
@@ -221,7 +282,7 @@ function render(){
     return `<article class="token-card" data-i="${i}">
       <div class="token-head">
         ${iconHtml}
-        <div class="token-name"><strong>${esc(p.baseToken?.name || 'Unknown')}</strong><small>$${esc(p.baseToken?.symbol || '?')} · ${ageHours(p.pairCreatedAt).toFixed(1)}h old</small></div>
+        <div class="token-name"><strong>${esc(p.baseToken?.name || 'Unknown')}</strong><small>${esc(p.baseToken?.symbol || '?')} · ${ageHours(p.pairCreatedAt).toFixed(1)}h old</small></div>
         <div class="score ${scoreClass}">${p.score}</div>
       </div>
       <div class="stats">
@@ -246,13 +307,16 @@ function openDetail(p){
   const websites = p.info?.websites || [];
   
   const iconHtml = isSafeUrl(p.info?.imageUrl)
-    ? `<img src="${p.info.imageUrl}" alt="">`
+    ? `<img src="${esc(p.info.imageUrl)}" alt="${esc(p.baseToken?.symbol||'')}">`
     : `<div class="token-icon"></div>`;
+  
+  const dexHref = safeHref(p.url || '#');
+  const solscanHref = `https://solscan.io/token/${encodeURIComponent(p.baseToken.address)}`;
   
   $('#detailContent').innerHTML=`
     <div class="detail-title">
       ${iconHtml}
-      <div><h2>${esc(p.baseToken.name)} <span style="color:#7f8998">($${esc(p.baseToken.symbol)})</span></h2><p>Score ${p.score}/100 · ${r[0]} risk · ${ageHours(p.pairCreatedAt).toFixed(1)} hours old</p></div>
+      <div><h2>${esc(p.baseToken.name)} <span style="color:#7f8998">(${esc(p.baseToken.symbol)})</span></h2><p>Score ${p.score}/100 · ${r[0]} risk · ${ageHours(p.pairCreatedAt).toFixed(1)} hours old</p></div>
     </div>
     <div class="detail-grid">
       <div class="detail-box"><small>Price</small><strong>${fmtMoney(p.priceUsd)}</strong></div>
@@ -265,22 +329,21 @@ function openDetail(p){
       <div class="detail-box"><small>DEX</small><strong>${esc(p.dexId || '—')}</strong></div>
     </div>
     <div class="action-row">
-      <a class="primary" href="${p.url || '#'}" target="_blank" rel="noopener">Open DEX Screener</a>
-      <a href="https://solscan.io/token/${encodeURIComponent(p.baseToken.address)}" target="_blank" rel="noopener">View on Solscan</a>
+      <a class="primary" href="${dexHref}" target="_blank" rel="noopener noreferrer">Open DEX Screener</a>
+      <a href="${safeHref(solscanHref)}" target="_blank" rel="noopener noreferrer">View on Solscan</a>
     </div>
-    <p class="disclaimer">The score uses public market/activity signals. This MVP does not verify developer wallets, holder concentration, mint/freeze authority, or social authenticity. Those checks should be added before treating a candidate as investable.</p>
+    <p class="disclaimer">The score uses public market/activity signals. This MVP does not verify developer wallets, holder concentration, mint/freeze authority, or social authenticity. Those checks should be performed server-side before making investment decisions.</p>
   `;
   $('#modal').classList.remove('hidden');
 }
 
 function esc(s){
-  return String(s || '').replace(/[&<>"']/g, m => ({
+  return String(s || '').replace(/[&<>"]+/g, m => ({
     '&': '&amp;',
     '<': '&lt;',
     '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  }[m]));
+    '"': '&quot;'
+  }[m] || m));
 }
 
 // Event listeners
